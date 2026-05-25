@@ -28,58 +28,33 @@ def get_cosine_lr(
 
 
 class AdamW(torch.optim.Optimizer):
-    def __init__(
-        self,
-        params: Iterable[torch.nn.parameter.Parameter],
-        lr: float = 1e-3,
+    def __init__(self, params, 
+                 lr: float = 1e-3,
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
-        weight_decay: float = 0.01,
-    ):
-        if not 0.0 <= lr:
-            raise ValueError(f"Invalid learning rate: {lr}")
-        if not 0.0 <= eps:
-            raise ValueError(f"Invalid epsilon value: {eps}")
-        if not 0.0 <= betas[0] < 1.0:
-            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
-        if not 0.0 <= betas[1] < 1.0:
-            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+        weight_decay: float = 0.01):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
-
-    def step(self, closure: Callable | None = None):
-        loss = None
-        if closure is not None:
-            loss = closure()
+    
+    def step(self, closure: Callable|None=None):
+        loss = None if closure is None else closure()
         for group in self.param_groups:
+            lr = group["lr"]
+            b1, b2 = group["betas"]
+            eps = group["eps"]
+            weight_decay = group["weight_decay"]
             for p in group["params"]:
-                if p.grad is None:
-                    continue
-
-                grad = p.grad.data
-                if grad.is_sparse:
-                    raise RuntimeError("Adam does not support sparse gradients")
-
+                if p.grad is None: continue
                 state = self.state[p]
-                alpha = group["lr"]
-                beta_1, beta_2 = group["betas"]
-                eps = group["eps"]
-                t = state.get("t", 1)
-
-                # Apply weight decay
-                alpha_t = alpha * (math.sqrt(1 - (beta_2**t)) / (1 - (beta_1**t)))
-                p.data -= alpha * group["weight_decay"] * p.data
-
-                prev_m_t = state.get("m", torch.zeros_like(grad))
-                prev_v_t = state.get("v", torch.zeros_like(grad))
-
-                m_t = beta_1 * prev_m_t + ((1 - beta_1) * grad)
-                v_t = beta_2 * prev_v_t + ((1 - beta_2) * torch.square(grad))
-
-                # Apply adjusted gradient step
-                p.data -= alpha_t * m_t / (torch.sqrt(v_t) + eps)
-
-                state["m"] = m_t
-                state["v"] = v_t
-                state["t"] = t + 1
+                t = state.get('t', 1)
+                m = state.get('m', 0)
+                v = state.get('v', 0)
+                lrt = lr*((1-b2**t)**0.5)/(1-b1**t)
+                p.data -= lr*weight_decay*p.data
+                m = b1*m+(1-b1)*p.grad
+                v = b2*v+(1-b2)*p.grad**2
+                p.data -= lrt*m/(v**0.5+eps)
+                state['t'] = t+1
+                state['m'] = m
+                state['v'] = v
         return loss
