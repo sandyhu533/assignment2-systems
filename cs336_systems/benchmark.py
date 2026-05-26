@@ -6,6 +6,7 @@ import timeit
 import numpy as np
 import json, sys
 import torch.cuda.nvtx as nvtx
+from contextlib import nullcontext
 
 cs336_basics.model.scaled_dot_product_attention = cs336_basics.model.annotated_scaled_dot_product_attention
 
@@ -28,6 +29,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--context_length", type=int,default=512)
+    parser.add_argument("--use_amp", action="store_true",
+                    help="Enable autocast mixed precision (BF16)")
     
     args = parser.parse_args()
     context_length = args.context_length
@@ -70,7 +73,10 @@ def main():
 
     config = model_config[args.size]
     need_optimize = args.mode == "full"
-        
+    
+    autocast_ctx = torch.autocast("cuda", dtype=torch.float16) if args.use_amp else nullcontext()
+    fwd_ctx = torch.inference_mode() if args.mode == "forward" else nullcontext()
+    
     random_dataset = np.random.randint(0, vocab_size, size=100_000, dtype=np.int32)
     
     rope = model.RotaryPositionalEmbedding(10000, context_length, config["d_model"]//config["num_heads"],device)
@@ -87,56 +93,52 @@ def main():
     opt = optimizer.AdamW(m.parameters())
     
     # warm up
-    nvtx.range_push("warmup")
     torch.cuda.synchronize()
-    for _ in range(args.warmup):
-        x, y = data.get_batch(random_dataset, batch_size, context_length, device)
-        if args.mode == "forward":
-            with torch.inference_mode():
+    for i in range(args.warmup):
+        with autocast_ctx:
+            x, y = data.get_batch(random_dataset, batch_size, context_length, device)
+            t0 = timeit.default_timer()
+            if args.mode == "forward":
+                with fwd_ctx:
+                    outputs = m(x)
+            else:
                 outputs = m(x)
-        else:
-            outputs = m(x)
-            loss = nn_utils.cross_entropy(outputs, y)
-            loss.backward()
-            if need_optimize:
-                opt.step()
-            opt.zero_grad()
-        torch.cuda.synchronize()
-    nvtx.range_pop()
+                loss = nn_utils.cross_entropy(outputs, y)
+                loss.backward()
+                if need_optimize:
+                    opt.step()
+                opt.zero_grad()
+            torch.cuda.synchronize()
+            diff = timeit.default_timer()-t0
+        print(f"warmup {i} time={round(diff,2)}ms mem={round(torch.cuda.max_memory_allocated(device)/1e9, 2)}GB")
     
     # nvtx.range_push("measure")
     torch.cuda.cudart().cudaProfilerStart()
     times = []
-    alloc_mem = []
-    reserve_mem = []
+    alloc_mem = 0
+    reserve_mem = 0
     torch.cuda.synchronize()
-    for _ in range(args.steps):
-        with nvtx.range("one_pass"):
+    for i in range(args.steps):
+        with nvtx.range("one_pass"), autocast_ctx:
             x, y = data.get_batch(random_dataset, batch_size, context_length, device)
             t0 = timeit.default_timer()
             if args.mode == "forward":
-                with nvtx.range("forward"):
-                    with torch.inference_mode():
-                        outputs = m(x)
-                    torch.cuda.synchronize()
+                with nvtx.range("forward"), fwd_ctx:
+                    outputs = m(x)
             else:
                 with nvtx.range("forward"):
                     outputs = m(x)
-                    loss = nn_utils.cross_entropy(outputs, y)
-                    torch.cuda.synchronize()
                 with nvtx.range("loss"):
                     loss = nn_utils.cross_entropy(outputs, y)
-                    torch.cuda.synchronize()
                 with nvtx.range("backward"):
                     loss.backward()
-                    torch.cuda.synchronize()
                 if need_optimize:
                     with nvtx.range("optimize"):
                         opt.step()
                         opt.zero_grad()
-                        torch.cuda.synchronize()
+            torch.cuda.synchronize()
             times.append(timeit.default_timer()-t0)
-    # nvtx.range_pop()
+        print(f"step {i} time={round(times[-1],2)}ms mem={round(torch.cuda.max_memory_allocated(device)/1e9, 2)}GB")
     torch.cuda.cudart().cudaProfilerStop()
     
     alloc_mem = torch.cuda.max_memory_allocated(device)
@@ -148,8 +150,8 @@ def main():
         "std_ms": time_ms.std(),
         "median_ms": np.median(time_ms),
         "p95_ms": np.percentile(time_ms, 95),
-        "peak_reserve_mem_gb": np.max(np.array(reserve_mem))/1e9,
-        "peak_alloc_mem_gb": np.max(np.array(alloc_mem))/1e9,
+        "peak_mem_gb": reserve_mem/1e9,
+        "peak_alloc_mem_gb": alloc_mem/1e9,
     }
     for k, v in stats.items():
         stats[k] = round(v, 2)

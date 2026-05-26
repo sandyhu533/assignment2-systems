@@ -1,0 +1,19 @@
+timestamp,size,ctx,mode,precision,warmup,steps,status,mean_ms,std_ms,median_ms,min_ms,p95_ms,peak_mem_gb,peak_resv_gb,tokens_per_sec,tflops,mfu,error
+2026-05-26_04:47:29,small,512,forward,fp32,5,10,ok,22.96,0.06,22.98,,23.03,0.95,,,,,
+2026-05-26_04:48:20,small,512,forward,amp,5,10,ok,19.25,0.7,19.45,,20.15,0.81,,,,,
+2026-05-26_04:49:07,medium,512,forward,fp32,5,10,ok,70.97,0.36,70.83,,71.64,2.15,,,,,
+2026-05-26_04:49:54,medium,512,forward,amp,5,10,ok,37.68,0.98,38.27,,38.65,2.03,,,,,
+2026-05-26_04:50:44,large,512,forward,fp32,5,10,ok,164.93,0.12,164.91,,165.13,4.48,,,,,
+2026-05-26_04:51:33,large,512,forward,amp,5,10,ok,78.03,0.09,78.07,,78.14,4.47,,,,,
+2026-05-26_04:52:25,small,512,full,fp32,5,10,ok,91.53,0.34,91.39,,92.17,6.43,,,,,
+2026-05-26_04:53:13,small,512,full,amp,5,10,ok,74.06,2.1,72.84,,77.47,5.11,,,,,
+2026-05-26_04:54:01,medium,512,full,fp32,5,10,ok,265.58,0.39,265.49,,266.23,17.23,,,,,
+2026-05-26_04:54:50,medium,512,full,amp,5,10,ok,176.12,1.07,175.89,,177.74,13.62,,,,,
+2026-05-26_04:55:28,large,512,full,fp32,5,10,rc=1,,,,,,,,,,,Processing events... Generated: 	No reports were generated |
+2026-05-26_04:55:55,large,512,full,amp,5,10,rc=1,,,,,,,,,,,Processing events... Generated: 	No reports were generated |
+2026-05-26_04:56:31,small,512,forward_backward,fp32,5,10,ok,81.91,0.23,81.87,,82.29,5.83,,,,,
+2026-05-26_04:57:20,small,512,forward_backward,amp,5,10,ok,58.43,1.85,57.54,,61.77,4.59,,,,,
+2026-05-26_04:58:21,medium,512,forward_backward,fp32,5,10,ok,234.55,0.38,234.47,,235.23,15.07,,,,,
+2026-05-26_04:59:12,medium,512,forward_backward,amp,5,10,ok,143.25,1.27,142.92,,145.35,11.86,,,,,
+2026-05-26_04:59:54,large,512,forward_backward,fp32,5,10,rc=1,,,,,,,,,,,Processing events... Generated: 	No reports were generated |
+2026-05-26_05:00:35,large,512,forward_backward,amp,5,10,ok,283.57,0.79,283.45,,284.76,24.01,,,,,
