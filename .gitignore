@@ -166,3 +166,4 @@ cython_debug/
 *.nsys-rep
 *.sqlite
 *.pickle
+.DS_Store
