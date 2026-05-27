@@ -165,6 +165,27 @@ backward: 163.58 -> 105.57ms
 optimize: 31.03 -> 32.87ms
 3. forward only Memory只有小幅下降，因为本身inference mode不用保存activation，模型参数量不受auto cast影响，小幅下降来自input output tensor和temp tensor；backward阶段Memry优化明显，而且参数量越大优化的越多，尤其是原本跑OOM的large模型在auto cast之后可以跑出来结果
 
+NSys数据结果，以forward pass medium为例
+**FP32** (主导)
+- `ampere_sgemm_128x64_tn`: 56.0%, 39.57ms, 168 instances, **avg 235µs ± 151µs (StdDev 64%)** — 同一 kernel 覆盖多种 shape
+- `ampere_sgemm_128x128_nn`: 5.3%, 3.76ms, 48 instances, avg 78µs ± 16µs
+
+**AMP** (分散到多个专用 Tensor Core kernel)
+- `s1688gemm_256x64_tn`: 14.4%, 5.02ms, 48 instances, avg 105µs ± 0.2µs
+- `s1688gemm_128x64_tn`: 8.2%, 2.84ms, 96 instances, avg 30µs ± 0.3µs
+- `s1688gemm_64x128_tn`: 7.4%, 2.59ms, 24 instances, avg 108µs ± 0.4µs
+- `s1688gemm_128x128_nn`: 1.6%, 0.54ms, 24 instances, avg 23µs ± 0.2µs
+
+Insights:
+1. 矩阵乘相关算子的GPU时间占比显著下降（63%->35%），占比下降是因为GEMM显著加速而非 GEMM 没加速
+2. 从原kernel变成了新的fp16系列kernel
+3. 出现了更多的异构kernel类型，因为FP16使用的是Tensor Core，kernel catalog 更精细
+
+为什么FP16更快：
+1. **Raw compute**: BF16/FP16 Tensor Core = ~2× FP32 CUDA core (165 vs 83 TFLOPS on 4090)
+2. **Memory bandwidth**: BF16/FP16 = half the bytes per element → halved memory traffic for memory-bound matmuls
+3. **Specialized dispatch**: cuBLAS has 6 specialized Tensor Core variants vs 3 sgemm variants, giving better shape coverage
+
 # memory_profiling
 
 # gradient_checkpointing
