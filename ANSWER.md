@@ -1,6 +1,8 @@
 # benchmarking_script
+
 a. done
 b. std small with warmup. tipical time:
+
 - medium:
 - forward 70ms
 - foward+backward 232ms
@@ -53,6 +55,7 @@ e. scale_dot_product_attention里面scores相关的矩阵乘法是ampere_sgemm_1
 通过观察发现scale_dot_product_attention中softmax耗时占整个scale_dot_product_attention的比例约50%，是性能瓶颈之一，而softmax的flops少到几乎可以忽略
 
 # mixed_precision_accumulation
+
 运行结果为：
 float32+float32: tensor(10.0001) 
 float16+float16: tensor(9.9531, dtype=torch.float16)
@@ -85,28 +88,30 @@ weights 永远是 fp32 (master copy)
 # benchmarking_mixed_precision
 
 a. 
->>>>>>>>>>>before autocasting>>>>>>>>>>>>
-param dtype: torch.float32
-input torch.float32
-after fc1 torch.float32
-after relu torch.float32
-after ln torch.float32
-after fc2 torch.float32
-logits torch.float32
-loss torch.float32
-fc1.grad: torch.float32
-fc2.grad: torch.float32
->>>>>>>>>>>after autocasting>>>>>>>>>>>>
-param dtype: torch.float32
-input torch.float32
-after fc1 torch.float16
-after relu torch.float16
-after ln torch.float32
-after fc2 torch.float16
-logits torch.float16
-loss torch.float32
-fc1.grad: torch.float32
-fc2.grad: torch.float32
+
+> > > > > > > > > > > before autocasting>>>>>>>>>>>>
+> > > > > > > > > > > param dtype: torch.float32
+> > > > > > > > > > > input torch.float32
+> > > > > > > > > > > after fc1 torch.float32
+> > > > > > > > > > > after relu torch.float32
+> > > > > > > > > > > after ln torch.float32
+> > > > > > > > > > > after fc2 torch.float32
+> > > > > > > > > > > logits torch.float32
+> > > > > > > > > > > loss torch.float32
+> > > > > > > > > > > fc1.grad: torch.float32
+> > > > > > > > > > > fc2.grad: torch.float32
+> > > > > > > > > > >
+> > > > > > > > > > > > > > > > > > > > > after autocasting>>>>>>>>>>>>
+> > > > > > > > > > > > > > > > > > > > > param dtype: torch.float32
+> > > > > > > > > > > > > > > > > > > > > input torch.float32
+> > > > > > > > > > > > > > > > > > > > > after fc1 torch.float16
+> > > > > > > > > > > > > > > > > > > > > after relu torch.float16
+> > > > > > > > > > > > > > > > > > > > > after ln torch.float32
+> > > > > > > > > > > > > > > > > > > > > after fc2 torch.float16
+> > > > > > > > > > > > > > > > > > > > > logits torch.float16
+> > > > > > > > > > > > > > > > > > > > > loss torch.float32
+> > > > > > > > > > > > > > > > > > > > > fc1.grad: torch.float32
+> > > > > > > > > > > > > > > > > > > > > fc2.grad: torch.float32
 
 b. 
 FP32/FP16/BF16/TF32性质总结：
@@ -156,8 +161,10 @@ medium: 265.58 -> 176.12ms, 17.23 -> 13.62GB
 large: OOM -> OOM
 
 Insights:
+
 1. 普遍来说模型越大优化效果越明显，因为大模型更加compute-bound on matmul，amp主要优化matmul
 2. GPU时间优化幅度forward > backward > optimize
+
 optimize grad, opt status都是FP32，auto case无变化
 forward比backward幅度大也是因为forward比backward更加compute-bound，backward每步还需要把梯度upcast，这部分也额外增加了成本
 forward: 70.97 -> 37.68ms
@@ -167,25 +174,102 @@ optimize: 31.03 -> 32.87ms
 
 NSys数据结果，以forward pass medium为例
 **FP32** (主导)
+
 - `ampere_sgemm_128x64_tn`: 56.0%, 39.57ms, 168 instances, **avg 235µs ± 151µs (StdDev 64%)** — 同一 kernel 覆盖多种 shape
 - `ampere_sgemm_128x128_nn`: 5.3%, 3.76ms, 48 instances, avg 78µs ± 16µs
 
 **AMP** (分散到多个专用 Tensor Core kernel)
+
 - `s1688gemm_256x64_tn`: 14.4%, 5.02ms, 48 instances, avg 105µs ± 0.2µs
 - `s1688gemm_128x64_tn`: 8.2%, 2.84ms, 96 instances, avg 30µs ± 0.3µs
 - `s1688gemm_64x128_tn`: 7.4%, 2.59ms, 24 instances, avg 108µs ± 0.4µs
 - `s1688gemm_128x128_nn`: 1.6%, 0.54ms, 24 instances, avg 23µs ± 0.2µs
 
 Insights:
+
 1. 矩阵乘相关算子的GPU时间占比显著下降（63%->35%），占比下降是因为GEMM显著加速而非 GEMM 没加速
 2. 从原kernel变成了新的fp16系列kernel
 3. 出现了更多的异构kernel类型，因为FP16使用的是Tensor Core，kernel catalog 更精细
 
 为什么FP16更快：
+
 1. **Raw compute**: BF16/FP16 Tensor Core = ~2× FP32 CUDA core (165 vs 83 TFLOPS on 4090)
 2. **Memory bandwidth**: BF16/FP16 = half the bytes per element → halved memory traffic for memory-bound matmuls
 3. **Specialized dispatch**: cuBLAS has 6 specialized Tensor Core variants vs 3 sgemm variants, giving better shape coverage
 
 # memory_profiling
 
+a. memory lifecycle分析：
+
+forward pass with xl model size
+
+memory timeline分为几个部分：
+
+- 模型参数部分占大多数，不随着时间变化
+- activation部分占小数
+  - 会随着时间变化，跟随transformer的周期运行，过程中会产生局部变量但在函数生命周期结束之后会被销毁
+  - 由于开启了inference mode，不保存activation  
+  最高峰在Attention scores softmax的位置
+
+full pass with medium model size
+
+最高峰在forward pass刚算完activation的时候
+
+整体的时间轴分为几个阶段：
+
+- 基线是有模型参数+state.m和v
+- forward pass：累计activations
+- backward pass：计算p.grad，同时释放activations
+- optimizer.step()：根据p.grad更新p.data和state.m和v
+- optimizer.zero_grad()：释放p.grad
+
+b. memory usage随context_length的变化（forward+full）
+
+forward pass with small model size (conetxt_length 256/512/1024)
+峰值显存和最大内存分配和context_length呈正相关关系
+峰值显存：562MB -> 705MB -> 1.2GB
+最大内存分配：12MB -> 48MB -> 192MB
+基线（模型参数）为580MB，在context_length达到1024的时候，明显看出activation和模型参数对显存的占用量量级已经很接近了
+
+full pass with small model size (conetxt_length 256/512/1024)
+峰值显存和context_length呈正相关关系
+峰值显存：2.7GB -> 4.4GB -> 9.5GB
+基线（模型参数+state）为2.2GB，峰值显存在context_length为1024时远超这个数
+
+c. mixed-precision对memory的影响（forward+full）
+
+forward pass with xl model size
+- 整体看起来优化不大，主要影响attn和ffn的activation
+- attn分配内存最多的部分是softmax计算，这块由于softmax操作在amp的黑名单所以也没受到影响
+- 由于开启了amp会多一些精度转换带来的临时内存申请
+
+full pass with medium model size
+- 基线（模型参数和state）没有产生变化
+- 峰值有明显下降，从15.2GB下降到12.3GB，反映出activation cast成fp16的影响
+
+d. xl model transformer residual stream大小
+
+以amp的结果为例：
+residual stream的大小是20.0MiB，和理论计算值一致
+- batch_size*context_length*d_model*4=2560*4*512*4/1024/1024=20MB
+attn_output和ffn_output的大小都是10.0MB
+- 因为这些层属于“白名单”被amp转成了fp16，所以大小是residual stream的一半
+ln_output的大小则是20.0MB
+- ln属于“黑名单”，大小等于residual stream
+
+e. 分析xl model forward pass的最大内存分配
+What is the size of the largest allocations  
+shown? Looking through the stack trace, can you tell where those allocations come from?
+最大的memory allocation是128MB，对应attn的softmax阶段
+
+f. Nsight Systems memory profiling
+
+using small 1024 context_length full mode amp for example, the top 5 memory saved for backward:
+softmax 192.0MiB
+einsum in annotated_scaled_dot_product_attention 96.0MiB
+mask in annotated_scaled_dot_product_attention 96.0MiB
+24.0MB:
+- w3x, w1x, w2x
+
 # gradient_checkpointing
+

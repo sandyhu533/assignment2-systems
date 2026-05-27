@@ -1,0 +1,7 @@
+timestamp,size,ctx,mode,precision,warmup,steps,status,mean_ms,std_ms,median_ms,min_ms,p95_ms,peak_mem_gb,peak_resv_gb,tokens_per_sec,tflops,mfu,error
+2026-05-27_19:09:34,small,512,forward,amp,5,10,ok,34.24,11.46,30.52,,54.35,0.81,,,,,
+2026-05-27_19:10:45,small,256,forward,amp,5,10,ok,22.11,0.77,21.77,,23.35,0.68,,,,,
+2026-05-27_19:11:57,small,1024,forward,amp,5,10,ok,46.6,0.5,46.59,,47.24,1.46,,,,,
+2026-05-27_19:13:11,small,512,full,amp,5,10,ok,98.28,17.33,92.08,,126.45,5.11,,,,,
+2026-05-27_19:14:27,small,256,full,amp,5,10,ok,93.4,1.62,93.15,,96.33,3.28,,,,,
+2026-05-27_19:15:38,small,1024,full,amp,5,10,ok,176.44,0.2,176.41,,176.78,11.06,,,,,

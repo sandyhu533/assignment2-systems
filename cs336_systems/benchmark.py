@@ -112,6 +112,8 @@ def main():
             diff = timeit.default_timer()-t0
         print(f"warmup {i} time={round(diff,2)}ms mem={round(torch.cuda.max_memory_allocated(device)/1e9, 2)}GB")
     
+    torch.cuda.memory._record_memory_history(max_entries=1000000)
+    
     # nvtx.range_push("measure")
     torch.cuda.cudart().cudaProfilerStart()
     times = []
@@ -140,6 +142,12 @@ def main():
             times.append(timeit.default_timer()-t0)
         print(f"step {i} time={round(times[-1],2)}ms mem={round(torch.cuda.max_memory_allocated(device)/1e9, 2)}GB")
     torch.cuda.cudart().cudaProfilerStop()
+    
+    suffix = ""
+    if args.use_amp:
+        suffix = "-amp"
+    torch.cuda.memory._dump_snapshot(f"mem-snapshot/memory_snapshot-{args.size}-{args.context_length}-{args.mode}{suffix}.pickle")
+    torch.cuda.memory._record_memory_history(enabled=None)
     
     alloc_mem = torch.cuda.max_memory_allocated(device)
     reserve_mem= torch.cuda.max_memory_reserved(device)

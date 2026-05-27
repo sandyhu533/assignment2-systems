@@ -1,0 +1,2 @@
+timestamp,size,ctx,mode,precision,warmup,steps,status,mean_ms,std_ms,median_ms,min_ms,p95_ms,peak_mem_gb,peak_resv_gb,tokens_per_sec,tflops,mfu,error
+2026-05-27_19:52:24,xl,512,forward,amp,5,10,ok,191.78,13.04,187.52,,211.9,14.42,,,,,

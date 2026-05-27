@@ -31,36 +31,37 @@ CSV_FILE="${OUT_DIR}/timings.csv"
 # precision: "fp32" (no flag) or "amp" (adds --use_amp).
 CONFIGS=(
   # --- forward only ---
-  "small  512  forward            fp32"
-  "small  512  forward            amp"
-  "medium 512  forward            fp32"
-  "medium 512  forward            amp"
-  "large 512  forward             fp32"
-  "large 512  forward             amp"
+  # "small  512  forward            fp32"
+  # "small  512  forward            amp"
+  # "medium 512  forward            fp32"
+  # "medium 512  forward            amp"
+  # "large 512  forward             fp32"
+  # "large 512  forward             amp"
+  "xl 512  forward             amp"
   # "small  256  forward            fp32"
   # "small  256  forward            amp"
   # "small  1024 forward            fp32"
   # "small  1024 forward            amp"
 
   # --- full step (fwd + bwd + opt) ---
-  "small  512  full               fp32"
-  "small  512  full               amp"
-  "medium 512  full               fp32"
-  "medium 512  full               amp"
-  "large  512  full               fp32"
-  "large  512  full               amp"
+  # "small  512  full               fp32"
+  # "small  512  full               amp"
+  # "medium 512  full               fp32"
+  # "medium 512  full               amp"
+  # "large  512  full               fp32"
+  # "large  512  full               amp"
   # "small  256  full               fp32"
   # "small  256  full               amp"
   # "small  1024 full               fp32"
   # "small  1024 full               amp"
 
   # --- forward + backward (no optimizer step) ---
-  "small  512  forward_backward   fp32"
-  "small  512  forward_backward   amp"
-  "medium 512  forward_backward   fp32"
-  "medium 512  forward_backward   amp"
-  "large  512  forward_backward   fp32"
-  "large  512  forward_backward   amp"
+  # "small  512  forward_backward   fp32"
+  # "small  512  forward_backward   amp"
+  # "medium 512  forward_backward   fp32"
+  # "medium 512  forward_backward   amp"
+  # "large  512  forward_backward   fp32"
+  # "large  512  forward_backward   amp"
   # "small  256  forward_backward   fp32"
   # "small  256  forward_backward   amp"
   # "small  1024 forward_backward   fp32"
@@ -143,6 +144,8 @@ run_one() {
   local cmd=(
     uv run nsys profile
       --trace=cuda,cudnn,cublas,osrt,nvtx
+      --cudabacktrace=memory
+      --cuda-memory-usage=true
       --pytorch=functions-trace,autograd-shapes-nvtx
       --capture-range=cudaProfilerApi
       --capture-range-end=stop
