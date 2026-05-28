@@ -264,12 +264,58 @@ shown? Looking through the stack trace, can you tell where those allocations com
 
 f. Nsight Systems memory profiling
 
-using small 1024 context_length full mode amp for example, the top 5 memory saved for backward:
-softmax 192.0MiB
-einsum in annotated_scaled_dot_product_attention 96.0MiB
-mask in annotated_scaled_dot_product_attention 96.0MiB
-24.0MB:
-- w3x, w1x, w2x
+以meduim 512 context_length模型的full pass的无amp版本内存分配为例，其参数为：
+# "medium": {
+#             "d_model": 1024,
+#             "d_ff": 4096,
+#             "num_layers": 24,
+#             "num_heads": 16
+#         },
+# context_lengt=512, back_size=4
+可以看到每个attention block大概是这样的activation结构：
+5*8MB + 3*64MB + 5*8MB + 5*32MB
+其中比较明确的是
+- 64MB = batch_size*context_length*context_length*num_heads*4
+- 8MB = batch_size*context_length*d_model*4
+- 32MB = batch_size*context_length*d_ff*4
+
+
+第一个5*8MB是：
+1. pynumber_add - residual stream输入（上一层的ffn output或者embedding lookup结果）
+2. pynumber_truedivice - rmsnorm的r/rms
+3. pynumber_mult - rmsnorm的x_normed*weight
+4. Q proj
+5. K proj
+
+3*64MB是：
+1. scores = q*k
+2. mask(scores) # 可以通过inplace操作优化掉这一步
+3. softmax(scores)
+
+第二个5*8MB是：
+1. attn_output = softmax(scores)*v
+2. output proj
+3. 把attn的结果累加到residual stream
+4. pynumber_truedivice - rmsnorm的r/rms
+5. pynumber_mult - rmsnorm的x_normed*weight
+
+5*32MB是：
+1. w1x
+2. w2x
+3. sigmoid(w1x)
+4. sigmoid(w1x)*w1x
+5. sigmoid(w1x)*w1x*w2x
 
 # gradient_checkpointing
+
+a. 假设不考虑计算成本，memory降低最多的策略是只保留输入的embedding output，每次backward都从头开始计算算到最顶层正在做backward的layer，直到把所有的layer的梯度都算完。
+这样的显存消耗是O(1)，计算消耗是O(N^2)
+
+b. 假设最多只能做一次重计算，最优策略是保存residual stream，即进入ln1+attn之前的x和进入ln2+ffn之前的x，这种策略的显存消耗是2*O(N) + max(attn_activation, ffn_activation)，计算消耗是O(N)
+
+题目的本意是不考虑常数项，计算应该把Transformer Block分成几段。假设总共有N个Block，要分成K端，保存的checkpoint=K*a，峰值activation=N/K*b，总消耗等于K*a + N/K*b，求导得出最小值的K= (N*b/a)^(1/2)，在a==b的时候K=N^(1/2)
+
+但实际上由于activation的常数项远大于residual stream的常数项，所以实际的最优策略一般是K=N即每个transformer block都保存一个checkpoint
+
+至于为什么不考虑最开始提出的这种方案是因为工程实现复杂，roi比较低
 
