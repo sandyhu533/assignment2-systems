@@ -386,8 +386,11 @@ forward_backward，fp32，warmup=1, steps=1
 | large | ✗ | OOM | — | — |
 | large | ✓ | 386.16 | 18.17 | 17.97 |
 
-#flash_forward
+# flash_forward
 
 a. skip to save time, 直接写triton吧
+b. trition implementation done
 
-# flash_attention
+# flash_backward
+
+# flash_benchmarking
