@@ -31,6 +31,8 @@ def main():
     parser.add_argument("--context_length", type=int,default=512)
     parser.add_argument("--use_amp", action="store_true",
                     help="Enable autocast mixed precision (BF16)")
+    parser.add_argument("--mem_snapshot", type=str, default="test.pickle")
+    parser.add_argument("--compile", action="store_true")
     
     args = parser.parse_args()
     context_length = args.context_length
@@ -90,6 +92,8 @@ def main():
         rope=rope,
         device=device
     )
+    if args.compile:
+        m = torch.compile(m)
     opt = optimizer.AdamW(m.parameters())
     
     # warm up
@@ -140,13 +144,10 @@ def main():
                         opt.zero_grad()
             torch.cuda.synchronize()
             times.append(timeit.default_timer()-t0)
-        print(f"step {i} time={round(times[-1],2)}ms mem={round(torch.cuda.max_memory_allocated(device)/1e9, 2)}GB")
+        print(f"step {i} time={round(times[-1]*1e3,2)}s mem={round(torch.cuda.max_memory_allocated(device)/1e9, 2)}GB")
     torch.cuda.cudart().cudaProfilerStop()
     
-    suffix = ""
-    if args.use_amp:
-        suffix = "-amp"
-    torch.cuda.memory._dump_snapshot(f"mem-snapshot/memory_snapshot-{args.size}-{args.context_length}-{args.mode}{suffix}.pickle")
+    torch.cuda.memory._dump_snapshot(args.mem_snapshot)
     torch.cuda.memory._record_memory_history(enabled=None)
     
     alloc_mem = torch.cuda.max_memory_allocated(device)

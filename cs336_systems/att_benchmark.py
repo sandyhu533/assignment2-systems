@@ -1,22 +1,17 @@
 import argparse
 import torch
 import cs336_basics
-from cs336_basics import model, nn_utils, optimizer, data
+from cs336_basics import model
 import timeit
 import numpy as np
 import json, sys
 import torch.cuda.nvtx as nvtx
 from contextlib import nullcontext
 
-cs336_basics.model.scaled_dot_product_attention = cs336_basics.model.annotated_scaled_dot_product_attention
-
 def emit_result(args, stats):
     """stats: dict with mean_ms, std_ms, median_ms, p95_ms"""
     payload = {
-        "mode":   args.mode,
-        "size":   args.size,
-        "warmup": args.warmup,
-        "steps":  args.steps,
+        **vars(args),
         **stats,
     }
     print("RESULT_JSON " + json.dumps(payload), file=sys.stdout, flush=True)
@@ -28,10 +23,10 @@ def main():
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--context_length", type=int,default=256)
     parser.add_argument("--d_model", type=int,default=16)
-    parser.add_argument("mode", type=str, default="forward", choices=["forward", "forward_backward"])
+    parser.add_argument("--mode", type=str, default="forward", choices=["forward", "forward_backward"])
     parser.add_argument("--use_amp", action="store_true")
-    parser.add_argument("--mem_snapshot", type=str)
-
+    parser.add_argument("--mem_snapshot", type=str, default="test.pickle")
+    parser.add_argument("--compile", action="store_true")
     
     args = parser.parse_args()
     context_length = args.context_length
@@ -42,48 +37,69 @@ def main():
     
     autocast_ctx = torch.autocast("cuda", dtype=torch.float16) if args.use_amp else nullcontext()
     fwd_ctx = torch.inference_mode() if args.mode == "forward" else nullcontext()
+    has_backward = args.mode == "forward_backward"
+    mask = torch.tril(torch.ones((context_length, context_length), device=device, dtype=torch.bool))
+    q = torch.rand((batch_size, num_heads, context_length, d_k), device=device, requires_grad=True)
+    k = torch.rand((batch_size, num_heads, context_length, d_k), device=device, requires_grad=True)
+    v = torch.rand((batch_size, num_heads, context_length, d_k), device=device, requires_grad=True)
     
-    def model_step():
-        with fwd_ctx:
-            q = torch.randint(0, 100, (batch_size, num_heads, context_length, d_k))
-            k = torch.randint(0, 100, (batch_size, num_heads, context_length, d_k))
-            v = torch.randint(0, 100, (batch_size, num_heads, context_length, d_k))
-            mask = torch.trill(torch.ones((context_length, context_length), dtype=torch.bool))
-            att = model.annotated_scaled_dot_product_attention(
-                q, k, v, mask
-            )
-            torch.cuda.synchronize()
-        if args.mode.contains("backward"):
-            att.backward()
-            torch.cuda.synchronize()
+    attention_layer = model.scaled_dot_product_attention
+    if args.compile:
+        attention_layer = torch.compile(attention_layer)
+    forward_times = []
+    backward_times = []
+    def forward_step(warmup, idx):
+        t0 = timeit.default_timer()
+        
+        with nvtx.range("one_pass"), autocast_ctx:
+            with fwd_ctx:
+                att = attention_layer(
+                    q, k, v, mask
+                )
+                torch.cuda.synchronize()
+            forward_time = round((timeit.default_timer()-t0)*1e3,2)
+            if not warmup:
+                forward_times.append(forward_time)
+            print(f'{warmup=} {idx=} {forward_time=}ms')
+        return att
     
-    for _ in range(args.warmup):
-        model_step()
+    def backward_step(att, warmup, idx):
+        t1 = timeit.default_timer()
+        if has_backward:
+            with nvtx.range("one_pass"):
+                att.sum().backward(retain_graph=True)
+                torch.cuda.synchronize()
+        backward_time = round((timeit.default_timer()-t1)*1e3,2)
+        if not warmup:
+            backward_times.append(backward_time)
+        print(f'{warmup=} {idx=} {backward_time=}ms')
+
+    att = None
+    for i in range(args.warmup):
+        att = forward_step(True, i)
+    for i in range(args.warmup):
+        backward_step(att, True, i)
     
+    torch.cuda.reset_peak_memory_stats()
     torch.cuda.memory._record_memory_history(max_entries=1000000)
     torch.cuda.cudart().cudaProfilerStart()
-    times = []
+    att = None
     for i in range(args.steps):
-        with nvtx.range("one_pass"), autocast_ctx:
-            t0 = timeit.default_timer()
-            model_step()
-            times.append(timeit.default_timer()-t0)
-        print(f"step {i} time={round(times[-1],2)}ms mem={round(torch.cuda.max_memory_allocated(device)/1e9, 2)}GB")
+        att = forward_step(False, i)
+    alloc_mem = torch.cuda.max_memory_allocated(device)
+    reserve_mem= torch.cuda.max_memory_reserved(device)
+    for i in range(args.steps):
+        backward_step(att, False, i)
     torch.cuda.cudart().cudaProfilerStop()
     
-    suffix = "-amp" if args.amp else ""
     torch.cuda.memory._dump_snapshot(args.mem_snapshot)
     torch.cuda.memory._record_memory_history(enabled=None)
     
-    alloc_mem = torch.cuda.max_memory_allocated(device)
-    reserve_mem= torch.cuda.max_memory_reserved(device)
-    
-    time_ms = np.array(times) * 1e3
+    forward_ms = np.array(forward_times)
+    backward_ms = np.array(backward_times)
     stats = {
-        "mean_ms": time_ms.mean(),
-        "std_ms": time_ms.std(),
-        "median_ms": np.median(time_ms),
-        "p95_ms": np.percentile(time_ms, 95),
+        "forward_ms": forward_ms.mean(),
+        "backward_ms": backward_ms.mean(),
         "peak_mem_gb": reserve_mem/1e9,
         "peak_alloc_mem_gb": alloc_mem/1e9,
     }

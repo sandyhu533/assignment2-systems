@@ -319,3 +319,75 @@ b. 假设最多只能做一次重计算，最优策略是保存residual stream�
 
 至于为什么不考虑最开始提出的这种方案是因为工程实现复杂，roi比较低
 
+# pytorch_attention
+benchmark script in cs336_systems/att_benchmark.py
+
+| d_model | ctx | forward_ms | backward_ms | peak_mem_gb | peak_alloc_mem_gb |
+|---|---|---|---|---|---|
+| 16 | 256 | 1.62 | 2.60 | 0.04 | 0.03 |
+| 16 | 1024 | 0.89 | 2.55 | 0.36 | 0.22 |
+| 16 | 4096 | 8.06 | 22.28 | 5.43 | 3.27 |
+| 16 | 8192 | 31.70 | 86.77 | 21.61 | 13.00 |
+| 16 | 16384 | OOM | OOM | — | — |
+| 32 | 256 | 0.86 | 2.42 | 0.05 | 0.03 |
+| 32 | 1024 | 0.89 | 2.47 | 0.37 | 0.23 |
+| 32 | 4096 | 8.08 | 22.38 | 5.96 | 3.29 |
+| 32 | 8192 | 31.69 | 87.42 | 23.76 | 13.04 |
+| 32 | 16384 | OOM | OOM | — | — |
+| 64 | 256 | 0.85 | 2.48 | 0.05 | 0.03 |
+| 64 | 1024 | 0.89 | 2.48 | 0.39 | 0.24 |
+| 64 | 4096 | 8.14 | 22.35 | 5.98 | 3.32 |
+| 64 | 8192 | 31.89 | 86.97 | 23.79 | 13.10 |
+| 64 | 16384 | OOM | OOM | — | — |
+| 128 | 256 | 0.84 | 2.52 | 0.05 | 0.04 |
+| 128 | 1024 | 0.89 | 2.49 | 0.41 | 0.25 |
+| 128 | 4096 | 8.43 | 22.91 | 6.57 | 3.39 |
+| 128 | 8192 | 32.99 | 88.99 | 19.59 | 13.24 |
+| 128 | 16384 | OOM | OOM | — | — |
+
+## 最小OOM参数量计算
+activation for d_model=16, ctx=16384
+B=8, L=16384, D=16, num_heads=1
+= 3BLD+3BLL*num_heads+2BL*num_heads+LL
+= 25,165,824 + 25,769,803,776 + 1,048,576 + 268,435,456 = 26,064,453,632 bytes ≈ 24.27 GiB
+GPU 0 has a total capacity of 23.54 GiB，所以必然会OOM
+
+## How does the memory saved for
+backward change with the sequence length
+与sequence length的平方成正比
+
+## What would you do to eliminate this memory
+cost
+主导项来自softmax和attn@v，即计算的中间结果，可以尽量减少中间结果的存储，用checkpointing方法在backward的时候重新做计算
+
+# torch_compile
+
+## attention
+- compile之后forward和backward_ms有大幅下降，peak_mem_gb也有大幅下降
+- compile之后peak_mem_gb和peak_alloc_mem_gb更加接近，原因是 compile 后峰值内存大幅减小，碎片（reserved 但未 alloc 的部分）随之减少
+
+ctx=4096, d_model=64, fp32, forward_backward
+
+| 配置 | compile | forward_ms | backward_ms | peak_mem_gb | peak_alloc_mem_gb |
+|---|---|---|---|---|---|
+| Annotated | ✗ | 8.86 | 22.43 | 5.98 | 3.32 |
+| Annotated | ✓ | 4.79 | 7.04 | 2.28 | 2.25 |
+| Not annotated | ✗ | 8.16 | 22.33 | 5.98 | 3.32 |
+| Not annotated | ✓ | 2.77 | 6.24 | 2.28 | 2.25 |
+
+## full model
+
+forward_backward，fp32，warmup=1, steps=1
+
+| size | compile | mean_ms | peak_mem_gb | peak_alloc_mem_gb |
+|---|---|---|---|---|
+| medium | ✗ | 241.92 | 13.80 | 12.95 |
+| medium | ✓ | 162.96 | 9.78 | 9.32 |
+| large | ✗ | OOM | — | — |
+| large | ✓ | 386.16 | 18.17 | 17.97 |
+
+#flash_forward
+
+a. skip to save time, 直接写triton吧
+
+# flash_attention
