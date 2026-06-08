@@ -1,6 +1,5 @@
 import argparse
 import torch
-import cs336_basics
 from cs336_basics import model
 import timeit
 import numpy as np
@@ -107,4 +106,5 @@ def main():
         stats[k] = round(v, 2)
     emit_result(args, stats)
 
-main()
+if __name__ == "__main__":
+    main()

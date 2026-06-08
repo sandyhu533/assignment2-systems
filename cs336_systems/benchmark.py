@@ -166,4 +166,5 @@ def main():
         stats[k] = round(v, 2)
     emit_result(args, stats)
 
-main()
+if __name__ == "__main__":
+    main()

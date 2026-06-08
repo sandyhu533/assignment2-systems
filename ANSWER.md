@@ -394,3 +394,84 @@ b. trition implementation done
 # flash_backward
 
 # flash_benchmarking
+
+# fsdp_accounting
+Param = 4N -> 4N/G
+Grad = 4N -> 4N/G
+Opt = 8N -> 8N/G
+
+Param = 2N -> 2N/G
+Grad = 2N -> 2N/G
+Opt = 12N -> 12N/G
+
+# alternate_ring_all_reduce
+t = (N-1)*S/W
+
+# data_parallel_calcs
+
+x1, x2, z (B, DF)
+y (B, D)
+
+a) FLOPS = 
+
+24: 2*B*D*DF
+25: skip
+26: skip
+27: 2*2*B*DF*D
+28, 29, 30: 2*B*D*DF
+
+Final flops = 12*B*D*DF/Ndp
+
+time = 12*B*D*DF/(Ndp*C)
+
+b)
+
+普通DP需要All reduce，因此需要两次通信
+
+S=3*D*DF*2*2 (FP16, All reduce)
+time=(N-1)*S/(N*W)
+communication time = (N-1)/N * (12*D*DF)/W
+
+c)
+
+bottlenecked:
+Ndp = BW/C
+
+# fsdp_calcs
+
+a)
+
+forward flops = 6*B*D*DF/N
+backward flops = 12*B*D*DF/N
+
+b)
+
+each all_gather or reduce-scatter: (N-1)/N * (6*D*DF)/W
+
+forward = (N-1)/N * (6*D*DF)/W
+backward = 2 * (N-1)/N * (6*D*DF)/W
+
+c)
+
+forward bottleneck: N=BW/C+1
+backward bottleneck: N=BW/C+1
+
+# tp_calcs
+
+a) dx = AllReduce_i(dx_partial^(i))
+
+b)
+forward flops = 6*B*D*DF/N
+backward flops = 12*B*D*DF/N
+
+c)
+S = B*D*2*2 (FP16, All-reduce)
+forward & backward time
+=(N-1)*S/(N*W)
+= (N-1)*2*B*D/(N*W)
+
+d)
+
+bottleneck 
+forward N = 3*W*Df/2*C + 1
+backward N = 3*W*Df/C + 1
