@@ -395,6 +395,49 @@ b. trition implementation done
 
 # flash_benchmarking
 
+# naive_ddp_benchmarking
+# minimal_ddp_flat_benchmarking
+# ddp_overlap_individual_parameters_benchmarking
+
+NVIDIA H100 80GB HBM3 * 2 (AdamWOpt)
+config: xl, ctx=512, full step, amp, compile, 2xGPU, warmup=5, steps=20
+metric                naive_ddp       chunked_flatten   overlap_ddp
+mean_ms (std)         329.97 (2.36)   329.03 (12.0)     300.86 (4.29)
+peak_mem_gb           75.53           75.53             75.53
+peak_alloc_gb         68.57           68.57             68.57
+commu_mean_ms (std)   56.52 (8.31)    54.83 (1.55)      -
+
+benchmark分析
+1. 如果把所有参数都一起flatten会有OOM，因此实现成了chunked_flatten，25MB一组发送
+2. 可以看到chunked_flatten相比naive_ddp在通信时间上有小幅下降~3%，并且方差明显变小，说明通信时间更加稳定，但整体下降幅度比较小，说明在xl配置下通信量的绝对数值大，因此建立连接不是瓶颈
+3. overlap_ddp相比naive_ddp和chunked_flatten耗时明显下降~8.8%，说明异步传输梯度数据可以提高整体效率
+nsys分析
+1. overlap ddp整体可以看到通信确实和计算overlap了，结果上来说也确实比naive ddp快，但是只快了30ms而不是50ms
+2. 原因是nccl reduce也需要占用计算资源，和本身梯度的计算发生资源挤占
+
+# optimizer_state_sharding_accounting
+# fsdp_accounting
+
+NVIDIA H100 80GB HBM3 * 2 (AdamWOpt)
+config: xl, ctx=512, full step, amp, compile, 2xGPU, warmup=5, steps=20
+metric                overlap_ddp     zero1           fsdp
+mean_ms (std)         274.43 (3.84)   271.26 (2.30)   391.47 (13.82)
+peak_mem_gb           75.53           58.39           38.94
+peak_alloc_gb         68.57           47.63           34.92
+
+benchmark分析
+1. 运行时间zero1略低于overlap_ddp，因为zero1的optimizer只需要计算一部分，加快了计算过程
+2. 运行时间fsdp显著高于zero1和overlap_ddp，因为fsdp每次forward和backward都需要all_gather，引入了额外的通信量
+3. peak_mem_gb overlap_ddp > zero1 > fsdp，对应分opt的收益和继续分参数的收益
+nsys分析
+1. FSDP的通信发生在forward（sync param）和backward（sync param & grad）的时候，和计算Overlap。但由于本身forward backward还是可能会被param block（即使prefech），nccl挤占计算资源等原因依然导致整体时间显著比zero1/ddp长（134ms vs 50ms）
+2. Zero1的通信发生在backward（sync grad）和计算overlap，Optimizer（sync param）发生在更新之后。所以Zero1的opt步骤虽然更新的参数量是ddp的一半，但相比overlap ddp只快了一点点（97ms vs 101ms）。相比而言FSDP更新的参数量是ddp的一半，又不需要同步参数，显著比overlap ddp要快（51ms vs 101ms）
+memviz分析
+记一份完整参数大小为P
+1. DDP param=1P, state=2P, grad=1P
+2. Zero1 param=1P, **state=1P**, grad=1P
+3. FSDP **param=0.5P**, state=1P, **grad=0.5P**
+
 # fsdp_accounting
 Param = 4N -> 4N/G
 Grad = 4N -> 4N/G
