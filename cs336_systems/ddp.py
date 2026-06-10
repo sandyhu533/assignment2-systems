@@ -1,11 +1,13 @@
 import torch
 import torch.distributed as dist
 from typing import Any
+import timeit
 
 class NaiveDDP(torch.nn.Module):
     def __init__(self, module: torch.nn.Module):
         super().__init__()
         self.module = module
+        self.comm_times = []
         
         for p in self.module.parameters():
             dist.broadcast(p.data, src=0)
@@ -14,14 +16,21 @@ class NaiveDDP(torch.nn.Module):
         return self.module(*args, **kwargs)
 
     def finish_gradient_synchronization(self):
+        torch.cuda.synchronize()
+        t1 = timeit.default_timer()
         for p in self.module.parameters():
             if p.requires_grad and p.grad is not None:
                 dist.all_reduce(p.grad, dist.ReduceOp.AVG)
+        torch.cuda.synchronize()
+        comm_time = timeit.default_timer() - t1
+        print(f'rank{dist.get_rank()} comm_time{round(comm_time*1e3,2)}s')
+        self.comm_times.append(comm_time)
 
 class FlattenDDP(torch.nn.Module):
     def __init__(self, module: torch.nn.Module):
         super().__init__()
         self.module = module
+        self.comm_times = []
         for p in self.module.parameters():
             dist.broadcast(p.data, src=0)
     
@@ -29,6 +38,8 @@ class FlattenDDP(torch.nn.Module):
         return self.module(*args, **kwargs)
     
     def finish_gradient_synchronization(self):
+        torch.cuda.synchronize()
+        t1 = timeit.default_timer()
         params = [p for p in self.module.parameters() if p.requires_grad]
         grads = [p.grad for p in params]
         flatten = torch._utils._flatten_dense_tensors(grads)
@@ -36,6 +47,10 @@ class FlattenDDP(torch.nn.Module):
         grads = torch._utils._unflatten_dense_tensors(flatten, grads)
         for grad, param in zip(grads, params):
             param.grad.copy_(grad)
+        torch.cuda.synchronize()
+        comm_time = timeit.default_timer() - t1
+        print(f'rank{dist.get_rank()} comm_time{round(comm_time*1e3,2)}s')
+        self.comm_times.append(comm_time)
 
 class OverlapDDP(torch.nn.Module):
     def __init__(self, module: torch.nn.Module):

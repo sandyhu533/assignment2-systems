@@ -1,166 +1,358 @@
 #!/usr/bin/env bash
+# Compare distributed training modes on a single node, 2 GPUs, with nsys-based
+# gradient-communication measurement.
 #
-# All-reduce benchmark sweep.  Self-contained: runs the benchmark across
-# {1,10,100,1000 MB} x {2,4,6 ranks}, then aggregates to CSV + plots.
+# For each --dist_mode, runs the benchmark under nsys, then extracts total NCCL
+# kernel time (AllReduce / ReduceScatter / AllGather) from the trace and reports
+# it alongside per-step time. This is the reliable way to measure comm time for
+# overlap_ddp / zero1 / fsdp, where wall-clock subtraction breaks down.
 #
-# Runner selection:
-#   - GPU present  -> "uv run python"
-#   - CPU only     -> ".venv/bin/python"
+# Multi-process note: mp.spawn children are traced via nsys --output=...%p, so
+# each rank writes its own .nsys-rep. We aggregate NCCL time from the child
+# trace with the most NCCL activity (the parent process has none).
 #
-# Usage:  ./run_sweep.sh [PY_SCRIPT] [REPORT_ROOT]
-# Default: PY_SCRIPT=cs336_systems/dist_single_node.py  REPORT_ROOT=report
-# Output goes to REPORT_ROOT/<YYYYMMDD_HHMMSS>/
-#
-set -uo pipefail
+# Usage:
+#   bash dist_sweep_nsys.sh                          # all modes, small, amp+compile
+#   SIZE=medium bash dist_sweep_nsys.sh
+#   MODES="naive_ddp zero1 fsdp" bash dist_sweep_nsys.sh
+#   USE_AMP=0 COMPILE=0 bash dist_sweep_nsys.sh      # fp32, no compile
+#   DRY_RUN=1 bash dist_sweep_nsys.sh                # print commands only
+#   NO_NSYS=1 bash dist_sweep_nsys.sh                # timing only, skip nsys
 
-PY_SCRIPT="${1:-cs336_systems/dist_single_node.py}"
-REPORT_ROOT="${2:-report}"
-VENV_PY="${VENV_PY:-.venv/bin/python}"   # CPU-path interpreter (override via env)
+set -euo pipefail
 
-# Each run gets its own subdir keyed by start time: report/YYYYMMDD_HHMMSS/
-RUN_TS="$(date +%Y%m%d_%H%M%S)"
-OUTDIR="${REPORT_ROOT}/${RUN_TS}"
-DATA_SIZES_MB=(1 10 100 1000)
-WORLD_SIZES=(2 4 6)
-WARMUP=5
-STEPS=20
+DEFAULT_OUT_DIR="report/dist_$(date +%Y%m%d_%H%M%S)"
+OUT_DIR="${OUT_DIR:-$DEFAULT_OUT_DIR}"
+WARMUP="${WARMUP:-5}"
+STEPS="${STEPS:-20}"
 
-RAW_DIR="${OUTDIR}/raw"
-mkdir -p "${RAW_DIR}"
+BENCH_MODULE="${BENCH_MODULE:-cs336_systems/benchmark.py}"
 
-# --- pick runner: GPU -> uv run python ; CPU -> .venv/bin/python ---------
-# Probe GPU count using uv's env first; if that fails, assume 0 (CPU).
-NGPU=$(uv run python -c "import torch;print(torch.cuda.device_count())" 2>/dev/null || echo 0)
-if [[ "${NGPU}" -gt 0 ]]; then
-  RUNNER=(uv run python)
-  MODE="GPU (uv run python)"
-else
-  if [[ ! -x "${VENV_PY}" ]]; then
-    echo "ERROR: no GPU detected and CPU interpreter '${VENV_PY}' not found/executable." >&2
-    echo "       create the venv or set VENV_PY=/path/to/python" >&2
-    exit 1
+MODES="${MODES:-naive_ddp flatten_ddp overlap_ddp zero1 fsdp}"
+
+SIZE="${SIZE:-small}"
+CTX="${CTX:-512}"
+MODE="${MODE:-full}"          # comm only matters with a backward pass
+
+USE_AMP="${USE_AMP:-1}"
+COMPILE="${COMPILE:-1}"
+
+MEM_SNAPSHOT="${MEM_SNAPSHOT:-0}"   # off by default; nsys + mem snapshot both heavy
+NO_NSYS="${NO_NSYS:-0}"             # set 1 to skip profiling entirely
+
+mkdir -p "$OUT_DIR"
+CSV_FILE="${OUT_DIR}/timings.csv"
+JSONL_FILE="${OUT_DIR}/timings.jsonl"
+RUN_LOG="${OUT_DIR}/run.log"
+export CSV_FILE JSONL_FILE
+: > "$JSONL_FILE"
+
+# ---------------------------------------------------------------------------
+# Resolve the nsys stats report name once (varies across nsys versions).
+# Newer: cuda_gpu_kern_sum   Older: gpukernsum
+# ---------------------------------------------------------------------------
+KERN_REPORT=""
+resolve_kern_report() {
+  [[ "$NO_NSYS" == "1" ]] && return 0
+  if ! command -v nsys >/dev/null 2>&1; then
+    echo "  ⚠ nsys not found; falling back to timing-only (NO_NSYS=1)" >&2
+    NO_NSYS=1
+    return 0
   fi
-  RUNNER=("${VENV_PY}")
-  MODE="CPU (${VENV_PY})"
-fi
-
-echo "=== all-reduce sweep ===  (detected ${NGPU} CUDA device(s))"
-echo "runner:     ${MODE}"
-echo "sizes=${DATA_SIZES_MB[*]}MB  ranks=${WORLD_SIZES[*]}  warmup=${WARMUP} steps=${STEPS}"
-echo "output dir: ${OUTDIR}"
-echo
-
-for ws in "${WORLD_SIZES[@]}"; do
-  if [[ "${NGPU}" -gt 0 && "${ws}" -gt "${NGPU}" ]]; then
-    echo ">> SKIP ws=${ws} (only ${NGPU} GPUs)"; continue
+  local avail
+  avail="$(nsys stats --help-reports 2>/dev/null || true)"
+  if grep -q 'cuda_gpu_kern_sum' <<<"$avail"; then
+    KERN_REPORT="cuda_gpu_kern_sum"
+  elif grep -q 'gpukernsum' <<<"$avail"; then
+    KERN_REPORT="gpukernsum"
+  else
+    # Last resort: try the new name, let it fail loudly per-run.
+    KERN_REPORT="cuda_gpu_kern_sum"
+    echo "  ⚠ could not confirm nsys kern-sum report name; assuming ${KERN_REPORT}" >&2
   fi
-  for mb in "${DATA_SIZES_MB[@]}"; do
-    echo -n ">> RUN ws=${ws} mb=${mb} ... "
-    "${RUNNER[@]}" "${PY_SCRIPT}" --world_size "${ws}" --data_size_mb "${mb}" \
-      --warmup "${WARMUP}" --steps "${STEPS}" > "${RAW_DIR}/ws${ws}_mb${mb}.log" 2>&1
-    [[ $? -eq 0 ]] && echo "ok" || echo "FAILED (see ${RAW_DIR}/ws${ws}_mb${mb}.log)"
+}
+
+# ---------------------------------------------------------------------------
+# Extract total NCCL kernel time (ns) from a single .nsys-rep.
+# Sums "Total Time" over any kernel whose name matches NCCL collectives.
+# Robust to column reordering by reading the CSV header.
+# ---------------------------------------------------------------------------
+nccl_ns_from_rep() {
+  local rep="$1"
+  nsys stats --report "$KERN_REPORT" --format csv --force-export=true "$rep" 2>/dev/null \
+  | python3 -c '
+import csv, sys, re
+rdr = csv.reader(sys.stdin)
+header = None
+total = 0.0
+name_idx = time_idx = None
+for row in rdr:
+    if not row:
+        continue
+    if header is None:
+        header = [c.strip().lower() for c in row]
+        # find a name-ish column and a total-time column
+        for i, c in enumerate(header):
+            if name_idx is None and ("name" in c or "kernel" in c):
+                name_idx = i
+            if time_idx is None and "total time" in c:
+                time_idx = i
+        if name_idx is None or time_idx is None:
+            # header not as expected; bail with 0
+            print(0); sys.exit(0)
+        continue
+    if name_idx >= len(row) or time_idx >= len(row):
+        continue
+    name = row[name_idx]
+    if re.search(r"nccl|allreduce|reducescatter|allgather|broadcast", name, re.I):
+        raw = row[time_idx].replace(",", "").strip()
+        try:
+            total += float(raw)
+        except ValueError:
+            pass
+print(int(total))
+'
+}
+
+# Pick the child trace with the most NCCL activity (parent has ~none) and
+# return its NCCL total in ns. Scans all %p-suffixed reps for this tag.
+nccl_ns_for_tag() {
+  local tag="$1"
+  local best=0
+  shopt -s nullglob
+  for rep in "${OUT_DIR}/${tag}"_*.nsys-rep; do
+    local ns
+    ns="$(nccl_ns_from_rep "$rep")"
+    [[ -z "$ns" ]] && ns=0
+    if (( ns > best )); then best=$ns; fi
   done
-done
+  shopt -u nullglob
+  echo "$best"
+}
 
-echo
-echo "=== aggregating ==="
+# ---------------------------------------------------------------------------
+# JSONL record (dynamic columns; bash meta authoritative)
+# ---------------------------------------------------------------------------
+record_result() {
+  local dist_mode="$1" size="$2" ctx="$3" step_mode="$4" precision="$5" \
+        compile="$6" status="$7" json_or_err="$8" nccl_ms="${9:-}"
+  local ts; ts="$(date +%Y-%m-%d_%H:%M:%S)"
 
-RAW_DIR="${RAW_DIR}" OUTDIR="${OUTDIR}" "${RUNNER[@]}" - <<'PYEOF'
-import os, re, json, csv, glob
-import numpy as np
+  TS="$ts" DMODE="$dist_mode" SIZE="$size" CTX="$ctx" STEPMODE="$step_mode" \
+  PREC="$precision" COMPILE="$compile" RWARMUP="$WARMUP" RSTEPS="$STEPS" \
+  STATUS="$status" NCCLMS="$nccl_ms" PAYLOAD="$json_or_err" \
+  python3 -c '
+import json, os
+row = {
+    "timestamp":     os.environ["TS"],
+    "dist_mode":     os.environ["DMODE"],
+    "size":          os.environ["SIZE"],
+    "ctx":           os.environ["CTX"],
+    "step_mode":     os.environ["STEPMODE"],
+    "precision":     os.environ["PREC"],
+    "compile":       os.environ["COMPILE"],
+    "warmup":        os.environ["RWARMUP"],
+    "steps":         os.environ["RSTEPS"],
+    "status":        os.environ["STATUS"],
+    "nccl_total_ms": os.environ.get("NCCLMS", ""),
+    "error":         "",
+}
+payload = os.environ.get("PAYLOAD", "")
+if row["status"] == "ok":
+    try:
+        stats = json.loads(payload)
+    except Exception as e:
+        row["error"] = "bad RESULT_JSON: %s" % e
+    else:
+        for k, v in stats.items():
+            if k not in row:
+                row[k] = v
+else:
+    row["error"] = payload
+with open(os.environ["JSONL_FILE"], "a") as f:
+    f.write(json.dumps(row) + "\n")
+'
+}
 
-raw, out = os.environ["RAW_DIR"], os.environ["OUTDIR"]
+# ---------------------------------------------------------------------------
+# CSV from JSONL, with two derived columns:
+#   nccl_per_step_ms = nccl_total_ms / steps
+#   nccl_comm_pct    = nccl_per_step_ms / mean_ms * 100
+# ---------------------------------------------------------------------------
+write_csv() {
+  python3 -c '
+import json, os, csv
 
-def extract_json(text):
-    for s in (m.start() for m in re.finditer(r"\{", text)):
-        depth = 0
-        for i in range(s, len(text)):
-            if text[i] == "{": depth += 1
-            elif text[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    try: return json.loads(text[s:i+1])
-                    except json.JSONDecodeError: break
-    return None
-
-def bus_factor(n): return 2.0*(n-1)/n
+lead  = ["timestamp", "dist_mode", "size", "ctx", "step_mode",
+         "precision", "compile", "warmup", "steps", "status"]
+trail = ["error"]
+fixed = set(lead) | set(trail)
 
 rows = []
-for log in sorted(glob.glob(os.path.join(raw, "ws*_mb*.log"))):
-    m = re.search(r"ws(\d+)_mb(\d+)\.log", os.path.basename(log))
-    ws, mb = int(m.group(1)), int(m.group(2))
-    txt = open(log).read()
-    d = extract_json(txt)
-    if d is None:
-        rows.append(dict(world_size=ws, data_size_mb=mb, status="failed",
-                         backend="", device="", avg_ms="", p50_ms="", p99_ms="",
-                         max_ms="", std_ms="", algbw_GBps="", busbw_GBps=""))
-        continue
-    nbytes = mb*1024*1024
-    avg = d["avg_ms"]
-    algbw = nbytes/(avg/1e3)/1e9 if avg > 0 else 0.0
-    busbw = algbw*bus_factor(ws)
-    rows.append(dict(world_size=ws, data_size_mb=mb, status="ok",
-                     backend=d.get("backend",""), device=d.get("device",""),
-                     avg_ms=avg, p50_ms=d["p50_ms"], p99_ms=d["p99_ms"],
-                     max_ms=d["max_ms"], std_ms=d["std_ms"],
-                     algbw_GBps=round(algbw,2), busbw_GBps=round(busbw,2)))
+with open(os.environ["JSONL_FILE"]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        r = json.loads(line)
+        def fnum(k):
+            try:
+                v = float(str(r.get(k, "")).replace(",", ""))
+                return v if v == v else None
+            except Exception:
+                return None
+        nccl_total = fnum("nccl_total_ms")
+        steps      = fnum("steps")
+        mean       = fnum("mean_ms")
+        if nccl_total is not None and steps and steps > 0:
+            per = nccl_total / steps
+            r["nccl_per_step_ms"] = round(per, 3)
+            if mean and mean > 0:
+                r["nccl_comm_pct"] = round(per / mean * 100, 2)
+        rows.append(r)
 
-cols = ["world_size","data_size_mb","status","backend","device",
-        "avg_ms","p50_ms","p99_ms","max_ms","std_ms","algbw_GBps","busbw_GBps"]
-csv_path = os.path.join(out, "summary.csv")
-with open(csv_path, "w", newline="") as f:
-    w = csv.DictWriter(f, fieldnames=cols); w.writeheader()
-    for r in sorted(rows, key=lambda x:(x["world_size"], x["data_size_mb"])): w.writerow(r)
-print("wrote", csv_path)
+dyn, seen = [], set(fixed)
+for r in rows:
+    for k in r:
+        if k not in seen:
+            seen.add(k); dyn.append(k)
 
-print("\n=== summary ===")
-hdr = f"{'ws':>3} {'MB':>5} {'avg_ms':>9} {'p50':>8} {'p99':>8} {'busbw_GBps':>11} {'status':>8}"
-print(hdr); print("-"*len(hdr))
-for r in sorted(rows, key=lambda x:(x["world_size"], x["data_size_mb"])):
-    print(f"{r['world_size']:>3} {r['data_size_mb']:>5} {str(r['avg_ms']):>9} "
-          f"{str(r['p50_ms']):>8} {str(r['p99_ms']):>8} {str(r['busbw_GBps']):>11} {r['status']:>8}")
+header = lead + dyn + trail
+with open(os.environ["CSV_FILE"], "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+    w.writeheader()
+    for r in rows:
+        w.writerow({k: r.get(k, "") for k in header})
+'
+}
 
-ok = [r for r in rows if r["status"]=="ok"]
-if not ok:
-    print("\n(no successful runs to plot)"); raise SystemExit
-try:
-    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-except Exception as e:
-    print(f"\n(skipping plots: {e})"); raise SystemExit
+# ---------------------------------------------------------------------------
+# One run
+# ---------------------------------------------------------------------------
+run_one() {
+  local dist_mode="$1"
+  local prec="fp32"; [[ "$USE_AMP" == "1" ]] && prec="amp"
+  local comp="no";   [[ "$COMPILE"  == "1" ]] && comp="yes"
+  local tag="${dist_mode}_${SIZE}_ctx${CTX}_${MODE}_${prec}"
+  [[ "$comp" == "yes" ]] && tag="${tag}_compile"
 
-wss = sorted({r["world_size"] for r in ok})
-sizes = sorted({r["data_size_mb"] for r in ok})
-def series(ws, key):
-    d = {r["data_size_mb"]: r[key] for r in ok if r["world_size"]==ws}
-    return [d.get(s, np.nan) for s in sizes]
+  local log="${OUT_DIR}/${tag}.log"
 
-plt.figure(figsize=(7,5))
-for ws in wss: plt.plot(sizes, series(ws,"avg_ms"), marker="o", label=f"{ws} ranks")
-plt.xscale("log"); plt.yscale("log"); plt.grid(True, which="both", alpha=.3); plt.legend()
-plt.xlabel("data size (MB)"); plt.ylabel("avg latency (ms)"); plt.title("All-reduce latency vs size")
-p=os.path.join(out,"latency_vs_size.png"); plt.tight_layout(); plt.savefig(p,dpi=130); plt.close(); print("wrote",p)
+  local bench_args=(
+    --size "$SIZE"
+    --mode "$MODE"
+    --context_length "$CTX"
+    --warmup "$WARMUP"
+    --steps  "$STEPS"
+    --dist
+    --dist_mode "$dist_mode"
+  )
+  [[ "$USE_AMP" == "1" ]] && bench_args+=( --use_amp )
+  [[ "$COMPILE" == "1" ]] && bench_args+=( --compile )
+  if [[ "$MEM_SNAPSHOT" == "1" ]]; then
+    bench_args+=( --mem_snapshot "${OUT_DIR}/${tag}_mem.pickle" )
+  fi
 
-plt.figure(figsize=(7,5))
-for ws in wss: plt.plot(sizes, series(ws,"busbw_GBps"), marker="s", label=f"{ws} ranks")
-plt.xscale("log"); plt.grid(True, which="both", alpha=.3); plt.legend()
-plt.xlabel("data size (MB)"); plt.ylabel("bus bandwidth (GB/s)"); plt.title("All-reduce bus bandwidth vs size")
-p=os.path.join(out,"busbw_vs_size.png"); plt.tight_layout(); plt.savefig(p,dpi=130); plt.close(); print("wrote",p)
+  local cmd
+  if [[ "$NO_NSYS" == "1" ]]; then
+    cmd=( uv run python "$BENCH_MODULE" "${bench_args[@]}" )
+  else
+    # %p -> one trace per process; child ranks carry the NCCL activity.
+    cmd=( uv run nsys profile
+            --trace=cuda,cudnn,cublas,nvtx
+            --capture-range=cudaProfilerApi
+            --capture-range-end=stop
+            --output="${OUT_DIR}/${tag}_%p"
+            --force-overwrite=true
+            -- python "$BENCH_MODULE" "${bench_args[@]}" )
+  fi
 
-mat = np.full((len(wss), len(sizes)), np.nan)
-for i,ws in enumerate(wss):
-    for j,s in enumerate(sizes):
-        v=[r["avg_ms"] for r in ok if r["world_size"]==ws and r["data_size_mb"]==s]
-        if v: mat[i,j]=v[0]
-plt.figure(figsize=(7,4.5))
-im=plt.imshow(mat, aspect="auto", cmap="viridis"); plt.colorbar(im, label="avg latency (ms)")
-plt.xticks(range(len(sizes)), [f"{s}MB" for s in sizes]); plt.yticks(range(len(wss)), [str(w) for w in wss])
-plt.xlabel("data size"); plt.ylabel("world size"); plt.title("Avg all-reduce latency (ms)")
-for i in range(len(wss)):
-    for j in range(len(sizes)):
-        if not np.isnan(mat[i,j]): plt.text(j,i,f"{mat[i,j]:.1f}",ha="center",va="center",color="w",fontsize=8)
-p=os.path.join(out,"heatmap_avg_ms.png"); plt.tight_layout(); plt.savefig(p,dpi=130); plt.close(); print("wrote",p)
-PYEOF
+  echo ""
+  echo "========================================================"
+  echo "[$(date +%H:%M:%S)] dist_mode=${dist_mode}  ->  ${tag}"
+  echo "========================================================"
 
-echo
-echo "done -> ${OUTDIR}/summary.csv + ${OUTDIR}/*.png"
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    printf '  %s\n' "${cmd[*]}"
+    return 0
+  fi
+
+  if "${cmd[@]}" > "$log" 2>&1; then
+    local json_line
+    json_line=$(grep -E '^RESULT_JSON ' "$log" | tail -1 | sed 's/^RESULT_JSON //')
+    if [[ -z "$json_line" ]]; then
+      echo "  ⚠ no RESULT_JSON (check $log)" >&2
+      record_result "$dist_mode" "$SIZE" "$CTX" "$MODE" "$prec" "$comp" "no_result" "missing RESULT_JSON" ""
+      return 0
+    fi
+
+    # Extract NCCL kernel time from the trace(s).
+    local nccl_ms=""
+    if [[ "$NO_NSYS" != "1" ]]; then
+      local nccl_ns
+      nccl_ns="$(nccl_ns_for_tag "$tag")"
+      if [[ -n "$nccl_ns" && "$nccl_ns" != "0" ]]; then
+        nccl_ms="$(python3 -c "print(round($nccl_ns/1e6, 3))")"
+      else
+        echo "  ⚠ no NCCL kernels found in trace for ${tag}" >&2
+      fi
+    fi
+
+    record_result "$dist_mode" "$SIZE" "$CTX" "$MODE" "$prec" "$comp" "ok" "$json_line" "$nccl_ms"
+    local mean
+    mean=$(python3 -c "import json;print(json.loads('''$json_line''').get('mean_ms',''))" 2>/dev/null)
+    printf '  ✓ mean=%s ms, nccl_total=%s ms\n' "$mean" "${nccl_ms:-n/a}"
+  else
+    local rc=$?
+    local err_tail; err_tail=$(tail -3 "$log" | tr '\n' ' ')
+    echo "  ⚠ FAILED rc=$rc (see $log): ${err_tail}" >&2
+    record_result "$dist_mode" "$SIZE" "$CTX" "$MODE" "$prec" "$comp" "rc=$rc" "$err_tail" ""
+    return 0
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+resolve_kern_report
+{
+  echo "============================================================"
+  echo "# dist_sweep_nsys run log"
+  echo "timestamp:    $(date '+%Y-%m-%d %H:%M:%S %z')"
+  echo "host:         $(hostname 2>/dev/null || echo '?')"
+  echo "cwd:          $(pwd)"
+  echo "out_dir:      ${OUT_DIR}"
+  echo "modes:        ${MODES}"
+  echo "size/ctx:     ${SIZE} / ${CTX}   step_mode=${MODE}"
+  echo "amp/compile:  ${USE_AMP} / ${COMPILE}"
+  echo "warmup/steps: ${WARMUP} / ${STEPS}"
+  echo "nsys:         $([[ "$NO_NSYS" == "1" ]] && echo disabled || echo "enabled (report=${KERN_REPORT})")"
+  echo "nsys version: $(nsys --version 2>/dev/null | head -1 || echo n/a)"
+  echo "gpu:          $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | paste -sd'; ' - || echo n/a)"
+  echo "============================================================"
+} | tee "$RUN_LOG"
+
+i=0; total=$(wc -w <<< "$MODES")
+for dm in $MODES; do
+  i=$((i+1))
+  echo ""
+  echo "### progress: $i / $total ###"
+  run_one "$dm"
+done
+
+if [[ "${DRY_RUN:-0}" != "1" ]] && [[ -s "$JSONL_FILE" ]]; then
+  write_csv
+fi
+
+{
+  echo ""
+  echo "============================================================"
+  echo "Done. Output dir: ${OUT_DIR}/"
+  echo "CSV: ${CSV_FILE}"
+  echo ""
+  echo "--- Results ---"
+  if [[ -f "$CSV_FILE" ]]; then
+    column -t -s ',' "$CSV_FILE" 2>/dev/null || cat "$CSV_FILE"
+  fi
+  echo "============================================================"
+} | tee -a "$RUN_LOG"

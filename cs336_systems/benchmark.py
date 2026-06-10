@@ -1,4 +1,5 @@
 import argparse
+import os
 import torch
 import cs336_basics
 from cs336_basics import model, nn_utils, optimizer, data
@@ -7,11 +8,15 @@ import numpy as np
 import json, sys
 import torch.cuda.nvtx as nvtx
 from contextlib import nullcontext
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import ddp
+import zero
+import fsdp
 
 cs336_basics.model.scaled_dot_product_attention = cs336_basics.model.annotated_scaled_dot_product_attention
 
 def emit_result(args, stats):
-    """stats: dict with mean_ms, std_ms, median_ms, p95_ms"""
     payload = {
         "mode":   args.mode,
         "size":   args.size,
@@ -20,26 +25,24 @@ def emit_result(args, stats):
         **stats,
     }
     print("RESULT_JSON " + json.dumps(payload), file=sys.stdout, flush=True)
-    
-def main():
-    
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--size", type=str, default="small", choices=["small", "medium", "large", "xl", "10B"],)
-    parser.add_argument("--mode", type=str, default="full", choices=["forward", "forward_backward", "full"])
-    parser.add_argument("--warmup", type=int, default=1)
-    parser.add_argument("--steps", type=int, default=1)
-    parser.add_argument("--context_length", type=int,default=512)
-    parser.add_argument("--use_amp", action="store_true",
-                    help="Enable autocast mixed precision (BF16)")
-    parser.add_argument("--mem_snapshot", type=str, default="test.pickle")
-    parser.add_argument("--compile", action="store_true")
-    
-    args = parser.parse_args()
+
+def setup(rank, world_size):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    backend = "gloo" if device == "cpu" else "nccl"
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "29500"
+    dist.init_process_group(backend, rank=rank, world_size=world_size)
+    if device == "cuda":
+        torch.cuda.set_device(rank)
+        
+def main(rank, world_size, args):
+    if args.dist:
+        setup(rank, world_size)
+        
     context_length = args.context_length
     vocab_size=10000
     batch_size=4
-    device="cuda"
-
+    device = f"cuda:{rank}" if args.dist else "cuda"
     model_config = {
         "small": {
             "d_model": 768,
@@ -94,6 +97,18 @@ def main():
     )
     if args.compile:
         m = torch.compile(m)
+    if args.dist:
+        if args.dist_mode == "naive_ddp":
+            m = ddp.NaiveDDP(m)
+        elif args.dist_mode == "flatten_ddp":
+            m = ddp.FlattenDDP(m)
+        elif args.dist_mode == "overlap_ddp":
+            m = ddp.OverlapDDP(m)
+        elif args.dist_mode == "zero1":
+            m = zero.Zero1(m)
+        elif args.dist_mode == "fsdp":
+            m = fsdp.FSDP(m)
+
     opt = optimizer.AdamW(m.parameters())
     
     # warm up
@@ -109,6 +124,8 @@ def main():
                 outputs = m(x)
                 loss = nn_utils.cross_entropy(outputs, y)
                 loss.backward()
+                if args.dist:
+                    m.finish_gradient_synchronization()
                 if need_optimize:
                     opt.step()
                 opt.zero_grad()
@@ -118,6 +135,9 @@ def main():
     
     torch.cuda.memory._record_memory_history(max_entries=1000000)
     
+    if args.dist:
+        m.comm_times.clear()
+        
     # nvtx.range_push("measure")
     torch.cuda.cudart().cudaProfilerStart()
     times = []
@@ -138,13 +158,16 @@ def main():
                     loss = nn_utils.cross_entropy(outputs, y)
                 with nvtx.range("backward"):
                     loss.backward()
+                with nvtx.range("sync_grad"):
+                    if args.dist:
+                        m.finish_gradient_synchronization()
                 if need_optimize:
                     with nvtx.range("optimize"):
                         opt.step()
                         opt.zero_grad()
             torch.cuda.synchronize()
             times.append(timeit.default_timer()-t0)
-        print(f"step {i} time={round(times[-1]*1e3,2)}s mem={round(torch.cuda.max_memory_allocated(device)/1e9, 2)}GB")
+        print(f"rank{rank} step {i} time={round(times[-1]*1e3,2)}s mem={round(torch.cuda.max_memory_allocated(device)/1e9, 2)}GB")
     torch.cuda.cudart().cudaProfilerStop()
     
     torch.cuda.memory._dump_snapshot(args.mem_snapshot)
@@ -152,19 +175,50 @@ def main():
     
     alloc_mem = torch.cuda.max_memory_allocated(device)
     reserve_mem= torch.cuda.max_memory_reserved(device)
-    
+        
     time_ms = np.array(times) * 1e3
+    commu_time = []
+    if args.dist_mode == "naive_ddp" or args.dist_mode == "flatten_ddp":
+        commu_time = m.comm_times
+    comm_ms = np.array(commu_time) * 1e3
     stats = {
         "mean_ms": time_ms.mean(),
         "std_ms": time_ms.std(),
         "median_ms": np.median(time_ms),
         "p95_ms": np.percentile(time_ms, 95),
+        "commu_mean_ms": comm_ms.mean(),
+        "commu_std_ms": comm_ms.std(),
+        "commu_median_ms": np.median(comm_ms),
+        "commu_p95_ms": np.percentile(comm_ms, 95),
         "peak_mem_gb": reserve_mem/1e9,
         "peak_alloc_mem_gb": alloc_mem/1e9,
     }
+    
     for k, v in stats.items():
         stats[k] = round(v, 2)
     emit_result(args, stats)
+    
+    if args.dist:
+        dist.barrier()
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--size", type=str, default="small", choices=["small", "medium", "large", "xl", "10B"],)
+    parser.add_argument("--mode", type=str, default="full", choices=["forward", "forward_backward", "full"])
+    parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--steps", type=int, default=1)
+    parser.add_argument("--context_length", type=int,default=512)
+    parser.add_argument("--use_amp", action="store_true",
+                    help="Enable autocast mixed precision (BF16)")
+    parser.add_argument("--mem_snapshot", type=str, default="test.pickle")
+    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--dist", action="store_true")
+    parser.add_argument("--dist_mode", type=str, default="naive_ddp", choices=["naive_ddp", "flatten_ddp", "overlap_ddp", "zero1", "fsdp"],)
+    
+    args = parser.parse_args()
+    if args.dist:
+        world_size = 2
+        mp.spawn(main, args=(world_size, args), nprocs=world_size, join=True)
+    else:
+        main(0, 1, args)
