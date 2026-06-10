@@ -28,9 +28,11 @@ STEPS="${STEPS:-20}"
 
 BENCH_MODULE="${BENCH_MODULE:-cs336_systems/benchmark.py}"
 
-MODES="${MODES:-naive_ddp flatten_ddp overlap_ddp zero1 fsdp}"
+# MODES="${MODES:-naive_ddp flatten_ddp overlap_ddp zero1 fsdp}"
+# MODES="${MODES:-naive_ddp chunked_flatten_ddp overlap_ddp}"
+MODES="${MODES:-overlap_ddp zero1 fsdp}"
 
-SIZE="${SIZE:-small}"
+SIZE="${SIZE:-xl}"
 CTX="${CTX:-512}"
 MODE="${MODE:-full}"          # comm only matters with a backward pass
 

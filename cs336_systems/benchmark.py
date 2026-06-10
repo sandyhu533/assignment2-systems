@@ -84,6 +84,12 @@ def main(rank, world_size, args):
     
     random_dataset = np.random.randint(0, vocab_size, size=100_000, dtype=np.int32)
     
+    torch.cuda.memory._record_memory_history(
+        max_entries=1000000,
+        stacks="all",
+        context="all",
+    )
+    
     rope = model.RotaryPositionalEmbedding(10000, context_length, config["d_model"]//config["num_heads"],device)
     m = model.TransformerLM(
         vocab_size,
@@ -102,14 +108,19 @@ def main(rank, world_size, args):
             m = ddp.NaiveDDP(m)
         elif args.dist_mode == "flatten_ddp":
             m = ddp.FlattenDDP(m)
+        elif args.dist_mode == "chunked_flatten_ddp":
+            m = ddp.ChunkedFlattenDDP(m)
         elif args.dist_mode == "overlap_ddp":
             m = ddp.OverlapDDP(m)
         elif args.dist_mode == "zero1":
-            m = zero.Zero1(m)
+            m = ddp.OverlapDDP(m)
         elif args.dist_mode == "fsdp":
             m = fsdp.FSDP(m)
 
-    opt = optimizer.AdamW(m.parameters())
+    if args.dist and (args.dist_mode == "zero1"):
+        opt = zero.Zero1(m.parameters(), optimizer.AdamWOpt)
+    else:
+        opt = optimizer.AdamWOpt(m.parameters())
     
     # warm up
     torch.cuda.synchronize()
@@ -131,11 +142,11 @@ def main(rank, world_size, args):
                 opt.zero_grad()
             torch.cuda.synchronize()
             diff = timeit.default_timer()-t0
-        print(f"warmup {i} time={round(diff,2)}ms mem={round(torch.cuda.max_memory_allocated(device)/1e9, 2)}GB")
+        print(f"warmup {i} time={round(diff*1e3,2)}ms mem={round(torch.cuda.max_memory_allocated(device)/1e9, 2)}GB")
     
-    torch.cuda.memory._record_memory_history(max_entries=1000000)
+    # torch.cuda.memory._record_memory_history(max_entries=1000000)
     
-    if args.dist:
+    if args.dist_mode == "naive_ddp" or args.dist_mode == "flatten_ddp" or args.dist_mode == "chunked_flatten_ddp":
         m.comm_times.clear()
         
     # nvtx.range_push("measure")
@@ -167,32 +178,40 @@ def main(rank, world_size, args):
                         opt.zero_grad()
             torch.cuda.synchronize()
             times.append(timeit.default_timer()-t0)
-        print(f"rank{rank} step {i} time={round(times[-1]*1e3,2)}s mem={round(torch.cuda.max_memory_allocated(device)/1e9, 2)}GB")
+        print(f"rank{rank} step {i} time={round(times[-1]*1e3,2)}ms mem={round(torch.cuda.max_memory_allocated(device)/1e9, 2)}GB")
     torch.cuda.cudart().cudaProfilerStop()
     
-    torch.cuda.memory._dump_snapshot(args.mem_snapshot)
+    if args.dist:
+        base, ext = os.path.splitext(args.mem_snapshot)
+        snapshot_path = f"{base}_rank{rank}{ext}"
+    else:
+        snapshot_path = args.mem_snapshot
+    torch.cuda.memory._dump_snapshot(snapshot_path)
     torch.cuda.memory._record_memory_history(enabled=None)
     
     alloc_mem = torch.cuda.max_memory_allocated(device)
     reserve_mem= torch.cuda.max_memory_reserved(device)
         
     time_ms = np.array(times) * 1e3
-    commu_time = []
-    if args.dist_mode == "naive_ddp" or args.dist_mode == "flatten_ddp":
-        commu_time = m.comm_times
-    comm_ms = np.array(commu_time) * 1e3
     stats = {
         "mean_ms": time_ms.mean(),
         "std_ms": time_ms.std(),
         "median_ms": np.median(time_ms),
         "p95_ms": np.percentile(time_ms, 95),
-        "commu_mean_ms": comm_ms.mean(),
-        "commu_std_ms": comm_ms.std(),
-        "commu_median_ms": np.median(comm_ms),
-        "commu_p95_ms": np.percentile(comm_ms, 95),
         "peak_mem_gb": reserve_mem/1e9,
         "peak_alloc_mem_gb": alloc_mem/1e9,
     }
+    commu_time = []
+    if args.dist_mode == "naive_ddp" or args.dist_mode == "flatten_ddp" or args.dist_mode == "chunked_flatten_ddp":
+        commu_time = m.comm_times
+        comm_ms = np.array(commu_time) * 1e3
+        comm_stats = {
+            "commu_mean_ms": comm_ms.mean(),
+            "commu_std_ms": comm_ms.std(),
+            "commu_median_ms": np.median(comm_ms),
+            "commu_p95_ms": np.percentile(comm_ms, 95),
+            }
+        stats.update(comm_stats)
     
     for k, v in stats.items():
         stats[k] = round(v, 2)
@@ -214,7 +233,7 @@ if __name__ == "__main__":
     parser.add_argument("--mem_snapshot", type=str, default="test.pickle")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--dist", action="store_true")
-    parser.add_argument("--dist_mode", type=str, default="naive_ddp", choices=["naive_ddp", "flatten_ddp", "overlap_ddp", "zero1", "fsdp"],)
+    parser.add_argument("--dist_mode", type=str, default="naive_ddp", choices=["naive_ddp", "flatten_ddp", "overlap_ddp", "zero1", "fsdp", "chunked_flatten_ddp"],)
     
     args = parser.parse_args()
     if args.dist:
